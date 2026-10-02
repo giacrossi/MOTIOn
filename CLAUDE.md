@@ -88,7 +88,7 @@ The standard build uses:
 ```
 -D_ASCII_SUPPORTED -D_UCS4_SUPPORTED -D_R16P
 ```
-`-D_R16P` enables 128-bit real support via PENF. The NVF templates do not define these (compiler differences).
+`-DPENF_R16P` enables 128-bit real support via PENF. The NVF templates do not define these (compiler differences).
 
 ## Compiler Support
 
