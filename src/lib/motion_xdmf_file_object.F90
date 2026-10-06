@@ -16,6 +16,9 @@ public :: XDMF_PARAMETERS
 
 character(1), parameter :: NL = new_line('a') !< New line (end record) character.
 
+integer(I8P), parameter :: ASYNC_TAGS_CHUNK = 65536_I8P              !< Minimum asyncronous tags buffer capacity.
+integer(I8P), parameter :: ASYNC_TAGS_MAX   = int(huge(1_I4P), I8P)  !< Maximum asyncronous tags buffer capacity.
+
 type :: xdmf_parameters_object
    !< Global named constants (paramters) class (container) of XDMF syntax.
    character(4)  :: XDMF_ATTR_CENTER_NODE              = 'Node'            !< XDMF attribute node  centered.
@@ -115,7 +118,8 @@ type, extends(file_base_object) :: xdmf_file_object
    integer(I4P)   :: xml=0_I4P        !< XML Logical unit.
    type(xml_tag)  :: tag              !< XML tags handler.
    logical        :: is_async=.false. !< Asyncronous saving.
-   type(string)   :: async_tags=string() !< Asyncronous tags data.
+   character(:), allocatable :: async_tags           !< Asyncronous tags data, only `1:async_tags_len` is meaningful.
+   integer(I8P)              :: async_tags_len=0_I8P !< Asyncronous tags data length, bytes used in `async_tags`.
    type(xml_file) :: dom              !< XMDF file parsed as linearized DOM.
    contains
       ! public methods
@@ -156,6 +160,8 @@ type, extends(file_base_object) :: xdmf_file_object
       procedure, pass(self) :: write_tag              !< Write tag.
       ! MPI methods
       procedure, pass(self) :: gather_async_tags !< Gather async tags.
+      ! private methods
+      procedure, pass(self), private :: append_async_tags !< Append a tag to the async tags buffer.
 endtype xdmf_file_object
 
 interface xdmf_file_object
@@ -195,6 +201,7 @@ contains
    endselect
    call self%file_base_object%initialize
    self%async_tags = ''
+   self%async_tags_len = 0_I8P
    self%filename = trim(adjustl(filename))
    if (self%myrank/=0_I4P) self%is_async = .true.
    if (.not.self%is_async) then
@@ -474,7 +481,7 @@ contains
       endif
       ! close asyncrounous collection of master MPI process, gather async tags before closing
       call self%gather_async_tags
-      if (self%myrank==0_I4P) call self%write_async_tags(async_tags=self%async_tags)
+      if (self%myrank==0_I4P) call self%write_async_tags(async_tags=self%async_tags(1:self%async_tags_len))
    endif
    call self%write_end_tag(name='Grid')
    endsubroutine close_grid_tag
@@ -516,12 +523,47 @@ contains
    endsubroutine open_grid_tag
 
    ! async tags
+   subroutine append_async_tags(self, tag_text)
+   !< Append a tag to the asyncronous tags buffer, a new line being added after it.
+   !<
+   !< The buffer capacity grows geometrically and the tag is copied straight into the spare capacity, thus appending costs
+   !< `O(len(tag_text))` amortised and allocates only when the buffer is actually grown.
+   !<
+   !< @NOTE Do **not** go back to `self%async_tags = self%async_tags//tag_text//NL`: that expression re-materialises the whole
+   !< accumulated buffer on **every** call, which is `O(N^2)` in the number of tags and, worse, LLVM Flang (amdflang, and so
+   !< every ROCm build) places those intermediate character temporaries on the **stack**. The accumulation then dies with
+   !< SIGSEGV as soon as the tags outgrow `RLIMIT_STACK`, i.e. after only ~4 MB of tags with the usual 8 MB stack limit.
+   class(xdmf_file_object), intent(inout) :: self     !< File handler.
+   character(*),            intent(in)    :: tag_text !< Tag text to append.
+   character(:), allocatable              :: buffer   !< Grown buffer.
+   integer(I8P)                           :: n        !< Bytes to append, trailing new line included.
+   integer(I8P)                           :: capacity !< Current buffer capacity.
+   integer(I8P)                           :: wanted   !< Wanted buffer capacity.
+
+   n = len(tag_text, kind=I8P) + 1_I8P
+   capacity = 0_I8P ; if (allocated(self%async_tags)) capacity = len(self%async_tags, kind=I8P)
+   if (self%async_tags_len + n > capacity) then
+      wanted = max(2_I8P * capacity, self%async_tags_len + n, ASYNC_TAGS_CHUNK)
+      if (wanted > ASYNC_TAGS_MAX) then
+         write(stderr, '(A)') 'error: asyncronous XDMF tags of MPI process '//trim(str(self%myrank))//' exceed '// &
+                              trim(str(ASYNC_TAGS_MAX))//' bytes, they cannot be gathered by MPI'
+         call MPI_ABORT(MPI_COMM_WORLD, 1_I4P, self%error)
+      endif
+      allocate(character(len=wanted) :: buffer)
+      if (self%async_tags_len > 0_I8P) buffer(1:self%async_tags_len) = self%async_tags(1:self%async_tags_len)
+      call move_alloc(from=buffer, to=self%async_tags)
+   endif
+   self%async_tags(self%async_tags_len+1_I8P:self%async_tags_len+n-1_I8P) = tag_text
+   self%async_tags(self%async_tags_len+n:self%async_tags_len+n) = NL
+   self%async_tags_len = self%async_tags_len + n
+   endsubroutine append_async_tags
+
    subroutine write_async_tags(self, async_tags)
    !< Write async tags of other (not mine...) processes.
    class(xdmf_file_object), intent(inout) :: self       !< File handler.
-   type(string),            intent(in)    :: async_tags !< Asyncronous tags data.
+   character(*),            intent(in)    :: async_tags !< Asyncronous tags data.
 
-   write(unit=self%xml, iostat=self%error) async_tags%chars()
+   write(unit=self%xml, iostat=self%error) async_tags
    endsubroutine write_async_tags
 
    ! header tag
@@ -623,7 +665,7 @@ contains
    if (.not.self%is_async) then
       call self%tag%write(unit=self%xml, iostat=self%error, is_indented=.true., end_record=NL, only_end=.true.)
    else
-      self%async_tags = self%async_tags//self%tag%stringify(is_indented=.true., only_end=.true.)//NL
+      call self%append_async_tags(tag_text=self%tag%stringify(is_indented=.true., only_end=.true.))
    endif
    endsubroutine write_end_tag
 
@@ -638,7 +680,7 @@ contains
    if (.not.self%is_async) then
       call self%tag%write(unit=self%xml, iostat=self%error, is_indented=.true., end_record=NL)
    else
-      self%async_tags = self%async_tags//self%tag%stringify(is_indented=.true.)//NL
+      call self%append_async_tags(tag_text=self%tag%stringify(is_indented=.true.))
    endif
    endsubroutine write_self_closing_tag
 
@@ -652,7 +694,7 @@ contains
    if (.not.self%is_async) then
       call self%tag%write(unit=self%xml, iostat=self%error, is_indented=.true., end_record=NL, only_start=.true.)
    else
-      self%async_tags = self%async_tags//self%tag%stringify(is_indented=.true., only_start=.true.)//NL
+      call self%append_async_tags(tag_text=self%tag%stringify(is_indented=.true., only_start=.true.))
    endif
    self%indent = self%indent + 2
    endsubroutine write_start_tag
@@ -669,7 +711,7 @@ contains
    if (.not.self%is_async) then
       call self%tag%write(unit=self%xml, iostat=self%error, is_indented=.true., is_content_indented=.true., end_record=NL)
    else
-      self%async_tags = self%async_tags//self%tag%stringify(is_indented=.true., is_content_indented=.true.)//NL
+      call self%append_async_tags(tag_text=self%tag%stringify(is_indented=.true., is_content_indented=.true.))
    endif
    endsubroutine write_tag
 
@@ -680,37 +722,55 @@ contains
    !< into its own async_tags string.
    class(xdmf_file_object), intent(inout) :: self               !< File handler.
    integer(I4P)                           :: my_async_tags_len  !< Length of my async tags.
-   integer(I4P)                           :: all_async_tags_len !< Length of all async tags, total lenght.
+   integer(I8P)                           :: all_async_tags_len !< Length of all async tags, total lenght.
    integer(I4P), allocatable              :: recvcounts(:)      !< Size of chars from other processes.
    integer(I4P), allocatable              :: offset(:)          !< Offset in receive buffer.
    character(:), allocatable              :: recvbuf            !< Receive buffer.
    integer(I4P)                           :: i                  !< Counter.
+
+   if (.not.allocated(self%async_tags)) then ! nothing has been appended, normalize the buffer
+      self%async_tags = ''
+      self%async_tags_len = 0_I8P
+   endif
 
    if (self%procs_number==1) return ! no multi MPI procs, nothing to gather
 
    call MPI_BARRIER(MPI_COMM_WORLD, self%error) ! all MPI procs must close their XDMF async tags
 
    ! gather all async tags lengths
-   my_async_tags_len = self%async_tags%len()
+   my_async_tags_len = int(self%async_tags_len, I4P) ! safe, `append_async_tags` caps the buffer at `ASYNC_TAGS_MAX`
    allocate(recvcounts(self%procs_number))
    allocate(offset(self%procs_number))
    call MPI_GATHER(my_async_tags_len, 1_I4P, MPI_INTEGER, recvcounts, 1_I4P, MPI_INTEGER, 0_I4P, MPI_COMM_WORLD, self%error)
    ! compute offset and total lenght of receive buffer
    if (self%myrank == 0_I4P) then
+      ! the total is accumulated in 64 bits and validated *before* the 32 bits offsets are computed, the offsets of an
+      ! oversized gathering would silently overflow
+      all_async_tags_len = 0_I8P
+      do i = 1, self%procs_number
+         all_async_tags_len = all_async_tags_len + int(recvcounts(i), I8P)
+      enddo
+      ! the gathered tags must be addressable by the 32 bits integer offsets/counts of MPI_GATHERV
+      if (all_async_tags_len > ASYNC_TAGS_MAX) then
+         write(stderr, '(A)') 'error: asyncronous XDMF tags of all MPI processes sum up to '//trim(str(all_async_tags_len))// &
+                              ' bytes, they exceed the '//trim(str(ASYNC_TAGS_MAX))//' bytes MPI_GATHERV limit'
+         call MPI_ABORT(MPI_COMM_WORLD, 1_I4P, self%error)
+      endif
       offset(1) = 0_I4P
-      all_async_tags_len = recvcounts(1)
       do i = 2, self%procs_number
          offset(i) = offset(i-1) + recvcounts(i-1)
-         all_async_tags_len = all_async_tags_len + recvcounts(i)
       enddo
       allocate(character(len=all_async_tags_len) :: recvbuf)
    else
       allocate(character(len=1) :: recvbuf)
    endif
    ! gather async tags
-   call MPI_GATHERV(self%async_tags%chars(), my_async_tags_len, MPI_CHARACTER, &
+   call MPI_GATHERV(self%async_tags(1:self%async_tags_len), my_async_tags_len, MPI_CHARACTER, &
                     recvbuf, recvcounts, offset, MPI_CHARACTER, &
                     0_I4P, MPI_COMM_WORLD, self%error)
-   if (self%myrank==0_I4P) self%async_tags = recvbuf
+   if (self%myrank==0_I4P) then
+      self%async_tags_len = all_async_tags_len
+      call move_alloc(from=recvbuf, to=self%async_tags) ! avoids copying the whole gathered buffer
+   endif
    endsubroutine gather_async_tags
 endmodule motion_xdmf_file_object
