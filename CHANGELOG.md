@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 Versions follow [Semantic Versioning](https://semver.org/).
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] — 2026-10-06
+### Fixed
+- **xdmf**: Append async tags into a growing buffer instead of reallocating
+
+- **build**: Exclude dependency docs/ from source scan
+
+
 ## [0.1.0] — 2026-10-02
 ### Fixed
 - **xdmf**: Allocate MPI gather receive buffers on all ranks
