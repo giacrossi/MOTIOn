@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 Versions follow [Semantic Versioning](https://semver.org/).
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.2] — 2026-10-06
+### Fixed
+- **install**: Make the release smoke test exercise the real build
+
+
 ## [0.1.1] — 2026-10-06
 ### Fixed
 - **xdmf**: Append async tags into a growing buffer instead of reallocating
